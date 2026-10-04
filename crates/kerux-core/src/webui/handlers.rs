@@ -10,15 +10,16 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::error;
 
 use super::models::*;
 use super::stream::{
-    agent_event_to_unsequenced_frames, ActiveStream, AgentRunner, MAX_CONCURRENT_RUNNING_STREAMS,
+    agent_event_to_unsequenced_frames, evict_expired_completed_streams, ActiveStream, AgentRunner,
+    MAX_CONCURRENT_RUNNING_STREAMS, STATE_CANCELLED, STATE_COMPLETED, STATE_ERRORED,
 };
 use crate::client::Message;
 
@@ -27,6 +28,9 @@ lazy_static::lazy_static! {
 }
 
 pub const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024; // 10MB
+
+pub type TokenGeneratorFn = Arc<dyn Fn() -> crate::error::Result<String> + Send + Sync>;
+pub type ClockFn = Arc<dyn Fn() -> Instant + Send + Sync>;
 
 #[derive(Clone)]
 pub struct WebUiState {
@@ -38,6 +42,9 @@ pub struct WebUiState {
     pub runtime_config: Arc<RwLock<crate::config::AppConfig>>,
     pub workspace_root: PathBuf,
     pub agent_runner: Arc<dyn AgentRunner>,
+    pub token_generator: Option<TokenGeneratorFn>,
+    pub clock_override: Option<ClockFn>,
+    pub persistence_failure_override: Arc<AtomicBool>,
 }
 
 impl WebUiState {
@@ -64,6 +71,9 @@ impl WebUiState {
             runtime_config,
             workspace_root,
             agent_runner: runner,
+            token_generator: None,
+            clock_override: None,
+            persistence_failure_override: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -83,6 +93,9 @@ impl WebUiState {
             runtime_config,
             workspace_root,
             agent_runner: runner,
+            token_generator: None,
+            clock_override: None,
+            persistence_failure_override: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -93,6 +106,14 @@ impl WebUiState {
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
     }
+
+    pub fn generate_token(&self) -> crate::error::Result<String> {
+        if let Some(ref gen) = self.token_generator {
+            gen()
+        } else {
+            generate_random_token()
+        }
+    }
 }
 
 pub fn now_epoch_secs() -> u64 {
@@ -102,15 +123,17 @@ pub fn now_epoch_secs() -> u64 {
         .as_secs()
 }
 
-pub fn generate_random_token() -> String {
+pub fn generate_random_token() -> crate::error::Result<String> {
     let mut bytes = [0u8; 32];
-    getrandom::getrandom(&mut bytes).unwrap_or_default();
+    getrandom::getrandom(&mut bytes).map_err(|e| {
+        crate::error::Error::Agent(format!("Cryptographic entropy generation failed: {e}"))
+    })?;
     let mut s = String::with_capacity(64);
     for b in bytes {
         use std::fmt::Write;
         let _ = write!(s, "{:02x}", b);
     }
-    s
+    Ok(s)
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -154,12 +177,24 @@ pub async fn login_handler(
     let expected = match &state.auth_password {
         Some(p) => p,
         None => {
-            let token = {
-                let mut tok = state.auth_token.write().await;
-                if tok.is_none() {
-                    *tok = Some(generate_random_token());
+            let token = match state.generate_token() {
+                Ok(t) => {
+                    let mut tok = state.auth_token.write().await;
+                    if tok.is_none() {
+                        *tok = Some(t.clone());
+                    }
+                    tok.clone().unwrap_or(t)
                 }
-                tok.clone().unwrap()
+                Err(e) => {
+                    error!("Token generation error: {e}");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: "Cryptographic token generation failed".to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
             };
             let mut res = (
                 StatusCode::OK,
@@ -179,11 +214,22 @@ pub async fn login_handler(
 
     let provided = req.password.unwrap_or_default();
     if constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
-        let token = {
-            let mut tok = state.auth_token.write().await;
-            let t = generate_random_token();
-            *tok = Some(t.clone());
-            t
+        let token = match state.generate_token() {
+            Ok(t) => {
+                let mut tok = state.auth_token.write().await;
+                *tok = Some(t.clone());
+                t
+            }
+            Err(e) => {
+                error!("Token generation error: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: "Cryptographic token generation failed".to_string(),
+                    }),
+                )
+                    .into_response();
+            }
         };
 
         let mut res = (
@@ -211,35 +257,49 @@ pub async fn login_handler(
 }
 
 pub async fn list_sessions_handler(State(state): State<WebUiState>) -> Response {
-    if !state.session_dir.exists() {
-        let _ = std::fs::create_dir_all(&state.session_dir);
-    }
+    let session_dir = state.session_dir.clone();
+    let summaries_res = tokio::task::spawn_blocking(move || {
+        if !session_dir.exists() {
+            let _ = std::fs::create_dir_all(&session_dir);
+        }
 
-    let mut summaries = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&state.session_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("json") {
-                if let Ok(data) = std::fs::read_to_string(&path) {
-                    if let Ok(detail) = serde_json::from_str::<SessionDetailResponse>(&data) {
-                        summaries.push(SessionSummary {
-                            id: detail.id,
-                            title: detail.title,
-                            created_at: detail.created_at,
-                            updated_at: detail.updated_at,
-                            message_count: detail.messages.len(),
-                        });
+        let mut summaries = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&session_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                    if let Ok(data) = std::fs::read_to_string(&path) {
+                        if let Ok(detail) = serde_json::from_str::<SessionDetailResponse>(&data) {
+                            summaries.push(SessionSummary {
+                                id: detail.id,
+                                title: detail.title,
+                                created_at: detail.created_at,
+                                updated_at: detail.updated_at,
+                                message_count: detail.messages.len(),
+                            });
+                        }
                     }
                 }
             }
         }
-    }
-
-    summaries.sort_by_key(|a| std::cmp::Reverse(a.updated_at));
-    Json(SessionsListResponse {
-        sessions: summaries,
+        summaries.sort_by_key(|a| std::cmp::Reverse(a.updated_at));
+        summaries
     })
-    .into_response()
+    .await;
+
+    match summaries_res {
+        Ok(summaries) => Json(SessionsListResponse {
+            sessions: summaries,
+        })
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to read sessions: {e}"),
+            }),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -265,31 +325,33 @@ pub async fn get_session_handler(
     let _guard = lock.lock().await;
 
     let path = state.session_dir.join(format!("{}.json", query.session_id));
-    if !path.exists() {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: "Session not found".to_string(),
-            }),
-        )
-            .into_response();
-    }
-
-    match std::fs::read_to_string(&path) {
-        Ok(data) => match serde_json::from_str::<SessionDetailResponse>(&data) {
-            Ok(detail) => Json(detail).into_response(),
-            Err(e) => (
+    let read_res = tokio::task::spawn_blocking(move || {
+        if !path.exists() {
+            return Err((StatusCode::NOT_FOUND, "Session not found".to_string()));
+        }
+        match std::fs::read_to_string(&path) {
+            Ok(data) => match serde_json::from_str::<SessionDetailResponse>(&data) {
+                Ok(detail) => Ok(detail),
+                Err(e) => Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to parse session file: {e}"),
+                )),
+            },
+            Err(e) => Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("Failed to parse session file: {e}"),
-                }),
-            )
-                .into_response(),
-        },
+                format!("Failed to read session file: {e}"),
+            )),
+        }
+    })
+    .await;
+
+    match read_res {
+        Ok(Ok(detail)) => Json(detail).into_response(),
+        Ok(Err((status, error))) => (status, Json(ErrorResponse { error })).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
-                error: format!("Failed to read session file: {e}"),
+                error: format!("Join error: {e}"),
             }),
         )
             .into_response(),
@@ -300,7 +362,19 @@ pub async fn new_session_handler(
     State(state): State<WebUiState>,
     Json(req): Json<NewSessionRequest>,
 ) -> Response {
-    let id = format!("sess_{}", &generate_random_token()[..12]);
+    let token = match state.generate_token() {
+        Ok(t) => t,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Entropy generation error: {e}"),
+                }),
+            )
+                .into_response()
+        }
+    };
+    let id = format!("sess_{}", &token[..12]);
     let title = req.title.unwrap_or_else(|| "New Session".to_string());
     let now = now_epoch_secs();
 
@@ -316,17 +390,25 @@ pub async fn new_session_handler(
     let _guard = lock.lock().await;
 
     let path = state.session_dir.join(format!("{id}.json"));
-    if crate::persist::write_json(&path, &detail).is_ok() {
-        return (StatusCode::OK, Json(NewSessionResponse { id, title })).into_response();
-    }
+    let fail_override = state.persistence_failure_override.load(Ordering::Relaxed);
+    let write_res = tokio::task::spawn_blocking(move || {
+        if fail_override {
+            return Err("Forced persistence failure".to_string());
+        }
+        crate::persist::write_json(&path, &detail).map_err(|e| e.to_string())
+    })
+    .await;
 
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(ErrorResponse {
-            error: "Failed to persist new session".to_string(),
-        }),
-    )
-        .into_response()
+    match write_res {
+        Ok(Ok(_)) => (StatusCode::OK, Json(NewSessionResponse { id, title })).into_response(),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "Failed to persist new session".to_string(),
+            }),
+        )
+            .into_response(),
+    }
 }
 
 pub async fn rename_session_handler(
@@ -347,36 +429,47 @@ pub async fn rename_session_handler(
     let _guard = lock.lock().await;
 
     let path = state.session_dir.join(format!("{}.json", req.session_id));
-    if !path.exists() {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: "Session not found".to_string(),
-            }),
-        )
-            .into_response();
-    }
-
-    if let Ok(data) = std::fs::read_to_string(&path) {
-        if let Ok(mut detail) = serde_json::from_str::<SessionDetailResponse>(&data) {
-            detail.title = req.title;
-            detail.updated_at = now_epoch_secs();
-            if crate::persist::write_json(&path, &detail).is_ok() {
-                return Json(StandardStatusResponse {
-                    status: "ok".to_string(),
-                })
-                .into_response();
+    let fail_override = state.persistence_failure_override.load(Ordering::Relaxed);
+    let res = tokio::task::spawn_blocking(move || {
+        if !path.exists() {
+            return Err((StatusCode::NOT_FOUND, "Session not found".to_string()));
+        }
+        if fail_override {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to update session".to_string(),
+            ));
+        }
+        if let Ok(data) = std::fs::read_to_string(&path) {
+            if let Ok(mut detail) = serde_json::from_str::<SessionDetailResponse>(&data) {
+                detail.title = req.title;
+                detail.updated_at = now_epoch_secs();
+                if crate::persist::write_json(&path, &detail).is_ok() {
+                    return Ok(());
+                }
             }
         }
-    }
+        Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to update session".to_string(),
+        ))
+    })
+    .await;
 
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(ErrorResponse {
-            error: "Failed to update session".to_string(),
-        }),
-    )
-        .into_response()
+    match res {
+        Ok(Ok(_)) => Json(StandardStatusResponse {
+            status: "ok".to_string(),
+        })
+        .into_response(),
+        Ok(Err((code, err))) => (code, Json(ErrorResponse { error: err })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Join error: {e}"),
+            }),
+        )
+            .into_response(),
+    }
 }
 
 pub async fn delete_session_handler(
@@ -397,22 +490,35 @@ pub async fn delete_session_handler(
     let _guard = lock.lock().await;
 
     let path = state.session_dir.join(format!("{}.json", req.session_id));
-    if !path.exists() {
-        return (
-            StatusCode::NOT_FOUND,
+    let del_res = tokio::task::spawn_blocking(move || {
+        if !path.exists() {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    })
+    .await;
+
+    match del_res {
+        Ok(Ok(_)) => Json(StandardStatusResponse {
+            status: "ok".to_string(),
+        })
+        .into_response(),
+        Ok(Err(code)) => (
+            code,
             Json(ErrorResponse {
                 error: "Session not found".to_string(),
             }),
         )
-            .into_response();
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Join error: {e}"),
+            }),
+        )
+            .into_response(),
     }
-
-    let _ = std::fs::remove_file(path);
-
-    Json(StandardStatusResponse {
-        status: "ok".to_string(),
-    })
-    .into_response()
 }
 
 pub async fn chat_start_handler(
@@ -432,13 +538,13 @@ pub async fn chat_start_handler(
     let (steer_tx, steer_rx) = mpsc::channel(16);
     let (event_tx, mut event_rx) = mpsc::channel(64);
 
-    // Atomic reservation of active stream slot under write lock
+    // Evict expired streams and atomically reserve stream slot under write lock
     let (stream_id, active_stream) = {
+        let now_override = state.clock_override.as_ref().map(|c| c());
+        evict_expired_completed_streams(&state.active_streams, now_override).await;
+
         let mut streams = state.active_streams.write().await;
-        let running_count = streams
-            .values()
-            .filter(|s| s.is_running.load(Ordering::Relaxed))
-            .count();
+        let running_count = streams.values().filter(|s| s.is_running()).count();
         if running_count >= MAX_CONCURRENT_RUNNING_STREAMS {
             return (
                 StatusCode::TOO_MANY_REQUESTS,
@@ -449,7 +555,19 @@ pub async fn chat_start_handler(
                 .into_response();
         }
 
-        let stream_id = format!("stream_{}", &generate_random_token()[..16]);
+        let token = match state.generate_token() {
+            Ok(t) => t,
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: "Entropy generation failed".to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+        };
+        let stream_id = format!("stream_{}", &token[..16]);
         let active_stream = Arc::new(ActiveStream::new(
             stream_id.clone(),
             req.session_id.clone(),
@@ -459,51 +577,79 @@ pub async fn chat_start_handler(
         (stream_id, active_stream)
     };
 
-    // Persist user message immediately under session lock
-    let history = {
+    // Persist user message immediately under session lock with rollback on failure
+    let path = state.session_dir.join(format!("{}.json", req.session_id));
+    let fail_override = state.persistence_failure_override.load(Ordering::Relaxed);
+    let user_msg_str = req.message.clone();
+    let session_id_str = req.session_id.clone();
+
+    let persist_user_res = {
         let lock = state.get_session_lock(&req.session_id).await;
         let _guard = lock.lock().await;
 
-        let path = state.session_dir.join(format!("{}.json", req.session_id));
-        let mut detail = if path.exists() {
-            std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|d| serde_json::from_str::<SessionDetailResponse>(&d).ok())
-                .unwrap_or_else(|| SessionDetailResponse {
-                    id: req.session_id.clone(),
+        tokio::task::spawn_blocking(move || {
+            if fail_override {
+                return Err("Forced persistence failure".to_string());
+            }
+
+            let mut detail = if path.exists() {
+                std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|d| serde_json::from_str::<SessionDetailResponse>(&d).ok())
+                    .unwrap_or_else(|| SessionDetailResponse {
+                        id: session_id_str.clone(),
+                        title: "Session".to_string(),
+                        created_at: now_epoch_secs(),
+                        updated_at: now_epoch_secs(),
+                        messages: Vec::new(),
+                    })
+            } else {
+                SessionDetailResponse {
+                    id: session_id_str.clone(),
                     title: "Session".to_string(),
                     created_at: now_epoch_secs(),
                     updated_at: now_epoch_secs(),
                     messages: Vec::new(),
+                }
+            };
+
+            detail.messages.push(SessionMessageDto {
+                role: "user".to_string(),
+                content: user_msg_str,
+                timestamp: now_epoch_secs(),
+            });
+            detail.updated_at = now_epoch_secs();
+
+            crate::persist::write_json(&path, &detail).map_err(|e| e.to_string())?;
+
+            let history = detail
+                .messages
+                .iter()
+                .map(|m| match m.role.as_str() {
+                    "user" => Message::user(&m.content),
+                    "system" => Message::system(&m.content),
+                    _ => Message::assistant(&m.content),
                 })
-        } else {
-            SessionDetailResponse {
-                id: req.session_id.clone(),
-                title: "Session".to_string(),
-                created_at: now_epoch_secs(),
-                updated_at: now_epoch_secs(),
-                messages: Vec::new(),
-            }
-        };
+                .collect::<Vec<_>>();
+            Ok(history)
+        })
+        .await
+    };
 
-        detail.messages.push(SessionMessageDto {
-            role: "user".to_string(),
-            content: req.message.clone(),
-            timestamp: now_epoch_secs(),
-        });
-        detail.updated_at = now_epoch_secs();
-
-        let _ = crate::persist::write_json(&path, &detail);
-
-        detail
-            .messages
-            .iter()
-            .map(|m| match m.role.as_str() {
-                "user" => Message::user(&m.content),
-                "system" => Message::system(&m.content),
-                _ => Message::assistant(&m.content),
-            })
-            .collect::<Vec<_>>()
+    let history = match persist_user_res {
+        Ok(Ok(h)) => h,
+        _ => {
+            // Remove stream slot on startup persistence failure
+            let mut streams = state.active_streams.write().await;
+            streams.remove(&stream_id);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Failed to persist user message".to_string(),
+                }),
+            )
+                .into_response();
+        }
     };
 
     let runner = state.agent_runner.clone();
@@ -539,35 +685,78 @@ pub async fn chat_start_handler(
 
         match outcome {
             Ok(content) => {
+                let fail_save = state_clone
+                    .persistence_failure_override
+                    .load(Ordering::Relaxed);
                 let lock = state_clone.get_session_lock(&session_id_clone).await;
                 let _guard = lock.lock().await;
-                let path = state_clone
+                let sess_path = state_clone
                     .session_dir
                     .join(format!("{session_id_clone}.json"));
-                if let Ok(data) = std::fs::read_to_string(&path) {
-                    if let Ok(mut detail) = serde_json::from_str::<SessionDetailResponse>(&data) {
-                        detail.messages.push(SessionMessageDto {
-                            role: "assistant".to_string(),
-                            content,
-                            timestamp: now_epoch_secs(),
-                        });
-                        detail.updated_at = now_epoch_secs();
-                        let _ = crate::persist::write_json(&path, &detail);
+                let sess_clone = session_id_clone.clone();
+                let save_content = content.clone();
+
+                let save_res = tokio::task::spawn_blocking(move || {
+                    if fail_save {
+                        return Err("Forced assistant save failure".to_string());
                     }
+                    if let Ok(data) = std::fs::read_to_string(&sess_path) {
+                        if let Ok(mut detail) = serde_json::from_str::<SessionDetailResponse>(&data)
+                        {
+                            detail.messages.push(SessionMessageDto {
+                                role: "assistant".to_string(),
+                                content: save_content,
+                                timestamp: now_epoch_secs(),
+                            });
+                            detail.updated_at = now_epoch_secs();
+                            return crate::persist::write_json(&sess_path, &detail)
+                                .map_err(|e| e.to_string());
+                        }
+                    }
+                    Err(format!("Failed to read session {sess_clone}"))
+                })
+                .await;
+
+                if let Ok(Err(e)) = save_res {
+                    error!("Failed to persist assistant message: {e}");
+                    stream_clone
+                        .buffer_raw_frame(
+                            "error".to_string(),
+                            serde_json::json!({ "error": format!("Persistence failure: {e}") })
+                                .to_string(),
+                        )
+                        .await;
+                }
+
+                if stream_clone.try_transition_terminal(STATE_COMPLETED) {
+                    stream_clone
+                        .buffer_raw_frame(
+                            "done".to_string(),
+                            serde_json::json!({ "message": content }).to_string(),
+                        )
+                        .await;
                 }
             }
             Err(e) => {
-                error!("Agent turn failed: {e}");
-                stream_clone
-                    .buffer_raw_frame(
-                        "error".to_string(),
-                        serde_json::json!({ "error": e.to_string() }).to_string(),
-                    )
-                    .await;
+                error!("Agent turn error: {e}");
+                if stream_clone.cancel_flag.load(Ordering::Relaxed) {
+                    if stream_clone.try_transition_terminal(STATE_CANCELLED) {
+                        stream_clone
+                            .buffer_raw_frame("cancelled".to_string(), "{}".to_string())
+                            .await;
+                    }
+                } else if stream_clone.try_transition_terminal(STATE_ERRORED) {
+                    stream_clone
+                        .buffer_raw_frame(
+                            "error".to_string(),
+                            serde_json::json!({ "error": e.to_string() }).to_string(),
+                        )
+                        .await;
+                }
             }
         }
 
-        stream_clone.mark_completed().await;
+        stream_clone.finalize_stream().await;
     });
 
     (
@@ -589,6 +778,9 @@ pub async fn chat_stream_handler(
     State(state): State<WebUiState>,
     Query(query): Query<StreamQuery>,
 ) -> Response {
+    let now_override = state.clock_override.as_ref().map(|c| c());
+    evict_expired_completed_streams(&state.active_streams, now_override).await;
+
     let stream_opt = {
         let streams = state.active_streams.read().await;
         streams.get(&query.stream_id).cloned()
@@ -639,7 +831,7 @@ pub async fn chat_stream_handler(
                 yield Ok::<Event, Infallible>(Event::default().event(frame.event).data(frame.data));
             }
 
-            let is_running = stream.is_running.load(Ordering::Relaxed);
+            let is_running = stream.is_running();
             if !is_running {
                 let final_frames = {
                     let buf = stream.buffered_events.read().await;
@@ -677,13 +869,29 @@ pub async fn chat_cancel_handler(
     State(state): State<WebUiState>,
     Json(req): Json<ChatCancelRequest>,
 ) -> Response {
-    let streams = state.active_streams.read().await;
-    if let Some(stream) = streams.get(&req.stream_id) {
+    let stream_opt = {
+        let streams = state.active_streams.read().await;
+        streams.get(&req.stream_id).cloned()
+    };
+
+    if let Some(stream) = stream_opt {
         stream.cancel_flag.store(true, Ordering::SeqCst);
-        stream
-            .buffer_raw_frame("cancelled".to_string(), "{}".to_string())
-            .await;
-        stream.mark_completed().await;
+        if stream.try_transition_terminal(STATE_CANCELLED) {
+            stream
+                .buffer_raw_frame("cancelled".to_string(), "{}".to_string())
+                .await;
+        }
+
+        // Spawn watchdog to ensure finalization after at most 5s join deadline
+        let stream_watchdog = stream.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            if stream_watchdog.is_running() {
+                let _ = stream_watchdog.try_transition_terminal(STATE_CANCELLED);
+            }
+            stream_watchdog.finalize_stream().await;
+        });
+
         return Json(StandardStatusResponse {
             status: "cancelled".to_string(),
         })
@@ -703,15 +911,25 @@ pub async fn chat_steer_handler(
     State(state): State<WebUiState>,
     Json(req): Json<ChatSteerRequest>,
 ) -> Response {
-    let streams = state.active_streams.read().await;
-    if let Some(stream) = streams.get(&req.stream_id) {
-        if stream.is_running.load(Ordering::Relaxed)
-            && stream.steer_tx.send(req.message).await.is_ok()
-        {
-            return Json(StandardStatusResponse {
-                status: "ok".to_string(),
-            })
-            .into_response();
+    let stream_opt = {
+        let streams = state.active_streams.read().await;
+        streams.get(&req.stream_id).cloned()
+    };
+
+    if let Some(stream) = stream_opt {
+        if stream.is_running() {
+            let tx_opt = {
+                let guard = stream.steer_tx.lock().await;
+                guard.clone()
+            };
+            if let Some(tx) = tx_opt {
+                if tx.send(req.message).await.is_ok() {
+                    return Json(StandardStatusResponse {
+                        status: "ok".to_string(),
+                    })
+                    .into_response();
+                }
+            }
         }
         return (
             StatusCode::BAD_REQUEST,
@@ -751,59 +969,79 @@ pub async fn list_directory_handler(
     Query(query): Query<PathQuery>,
 ) -> Response {
     let sub = query.path.unwrap_or_default();
-    let target = state.workspace_root.join(sub);
+    let ws_root = state.workspace_root.clone();
 
-    let canonical = match dunce_canonicalize(&target) {
-        Ok(c) => c,
-        Err(_) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse {
-                    error: "Directory not found".to_string(),
-                }),
-            )
-                .into_response()
+    let list_res = tokio::task::spawn_blocking(move || {
+        if sub.contains("..") {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Access denied: Path escapes workspace root".to_string(),
+            ));
         }
-    };
 
-    let ws_canonical = match dunce_canonicalize(&state.workspace_root) {
-        Ok(c) => c,
-        Err(_) => state.workspace_root.clone(),
-    };
+        let target = ws_root.join(&sub);
+        let canonical = match dunce_canonicalize(&target) {
+            Ok(c) => c,
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    return Err((StatusCode::NOT_FOUND, "Directory not found".to_string()));
+                }
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "Access denied: Path escapes workspace root".to_string(),
+                ));
+            }
+        };
 
-    if canonical.strip_prefix(&ws_canonical).is_err() {
-        return (
-            StatusCode::FORBIDDEN,
+        let ws_canonical = match dunce_canonicalize(&ws_root) {
+            Ok(c) => c,
+            Err(_) => ws_root.clone(),
+        };
+
+        if canonical.strip_prefix(&ws_canonical).is_err() {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Access denied: Path escapes workspace root".to_string(),
+            ));
+        }
+
+        let mut items = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&canonical) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                let is_dir = p.is_dir();
+                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                let name = entry.file_name().to_string_lossy().to_string();
+                let rel_path = p
+                    .strip_prefix(&ws_canonical)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .to_string();
+                items.push(DirectoryEntryDto {
+                    name,
+                    path: rel_path,
+                    is_dir,
+                    size,
+                });
+            }
+        }
+
+        items.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
+        Ok(items)
+    })
+    .await;
+
+    match list_res {
+        Ok(Ok(items)) => Json(DirectoryListResponse { items }).into_response(),
+        Ok(Err((status, error))) => (status, Json(ErrorResponse { error })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
-                error: "Access denied: Path escapes workspace root".to_string(),
+                error: format!("Join error: {e}"),
             }),
         )
-            .into_response();
+            .into_response(),
     }
-
-    let mut items = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&canonical) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            let is_dir = p.is_dir();
-            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-            let name = entry.file_name().to_string_lossy().to_string();
-            let rel_path = p
-                .strip_prefix(&ws_canonical)
-                .unwrap_or(&p)
-                .to_string_lossy()
-                .to_string();
-            items.push(DirectoryEntryDto {
-                name,
-                path: rel_path,
-                is_dir,
-                size,
-            });
-        }
-    }
-
-    items.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
-    Json(DirectoryListResponse { items }).into_response()
 }
 
 pub async fn read_file_handler(
@@ -823,62 +1061,69 @@ pub async fn read_file_handler(
         }
     };
 
-    let target = state.workspace_root.join(&sub);
-    let canonical = match dunce_canonicalize(&target) {
-        Ok(c) => c,
-        Err(_) => {
-            if sub.contains("..") {
-                return (
+    let ws_root = state.workspace_root.clone();
+    let sub_clone = sub.clone();
+
+    let file_res = tokio::task::spawn_blocking(move || {
+        if sub_clone.contains("..") {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Access denied: Path escapes workspace root".to_string(),
+            ));
+        }
+
+        let target = ws_root.join(&sub_clone);
+        let canonical = match dunce_canonicalize(&target) {
+            Ok(c) => c,
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    return Err((StatusCode::NOT_FOUND, "File not found".to_string()));
+                }
+                return Err((
                     StatusCode::FORBIDDEN,
-                    Json(ErrorResponse {
-                        error: "Access denied: Path escapes workspace root".to_string(),
-                    }),
-                )
-                    .into_response();
+                    "Access denied: Path escapes workspace root".to_string(),
+                ));
             }
-            return (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse {
-                    error: "File not found".to_string(),
-                }),
-            )
-                .into_response();
+        };
+
+        let ws_canonical = match dunce_canonicalize(&ws_root) {
+            Ok(c) => c,
+            Err(_) => ws_root.clone(),
+        };
+
+        if canonical.strip_prefix(&ws_canonical).is_err() {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Access denied: Path escapes workspace root".to_string(),
+            ));
         }
-    };
 
-    let ws_canonical = match dunce_canonicalize(&state.workspace_root) {
-        Ok(c) => c,
-        Err(_) => state.workspace_root.clone(),
-    };
-
-    if canonical.strip_prefix(&ws_canonical).is_err() {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(ErrorResponse {
-                error: "Access denied: Path escapes workspace root".to_string(),
-            }),
-        )
-            .into_response();
-    }
-
-    if let Ok(meta) = std::fs::metadata(&canonical) {
-        if meta.len() > MAX_FILE_SIZE_BYTES {
-            return (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                Json(ErrorResponse {
-                    error: "File size exceeds 10MB limit".to_string(),
-                }),
-            )
-                .into_response();
+        if let Ok(meta) = std::fs::metadata(&canonical) {
+            if meta.len() > MAX_FILE_SIZE_BYTES {
+                return Err((
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "File size exceeds 10MB limit".to_string(),
+                ));
+            }
         }
-    }
 
-    match std::fs::read_to_string(&canonical) {
-        Ok(content) => Json(FileContentResponse { path: sub, content }).into_response(),
+        match std::fs::read_to_string(&canonical) {
+            Ok(content) => Ok(content),
+            Err(e) => Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to read file: {e}"),
+            )),
+        }
+    })
+    .await;
+
+    match file_res {
+        Ok(Ok(content)) => Json(FileContentResponse { path: sub, content }).into_response(),
+        Ok(Err((status, error))) => (status, Json(ErrorResponse { error })).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
-                error: format!("Failed to read file: {e}"),
+                error: format!("Join error: {e}"),
             }),
         )
             .into_response(),

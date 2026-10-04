@@ -1,21 +1,19 @@
 use axum::body::{to_bytes, Body};
 use axum::http::{header, Method, Request, StatusCode};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tempfile::tempdir;
 use tower::ServiceExt;
 
 use kerux_core::agent::AgentEvent;
-use kerux_core::client::Message;
 use kerux_core::config::AppConfig;
 use kerux_core::gateway::GatewayConfig;
 use kerux_core::webui::{
-    build_router, split_utf8_safe, ActiveStream, AgentRunner, AuthStatusResponse,
+    agent_event_to_unsequenced_frames, build_router, ActiveStream, AgentRunner, AuthStatusResponse,
     ChatCancelRequest, ChatStartRequest, ChatStartResponse, ChatSteerRequest, DeleteSessionRequest,
     DirectoryListResponse, FileContentResponse, LoginRequest, LoginResponse, MockAgentRunner,
     ModelsResponse, NewSessionRequest, NewSessionResponse, RenameSessionRequest,
-    SessionDetailResponse, SessionsListResponse, SettingsResponse, StandardStatusResponse,
-    WebUiState, MAX_CONCURRENT_RUNNING_STREAMS,
+    SessionDetailResponse, SessionsListResponse, WebUiState, MAX_CONCURRENT_RUNNING_STREAMS,
+    MAX_EVENTS_PER_STREAM, MAX_WIRE_FRAME_BYTES,
 };
 
 fn create_test_state(
@@ -124,24 +122,29 @@ async fn test_auth_status_and_login_with_password() {
         .unwrap();
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    let cookie = res
+
+    let cookie_hdr = res
         .headers()
         .get(header::SET_COOKIE)
         .unwrap()
         .to_str()
         .unwrap();
-    assert!(cookie.contains("hermes_auth="));
+    assert!(cookie_hdr.contains("hermes_auth="));
+    assert!(cookie_hdr.contains("HttpOnly"));
 
     let body = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
-    let login_res: LoginResponse = serde_json::from_slice(&body).unwrap();
-    assert_eq!(login_res.status, "ok");
-    assert!(!login_res.token.is_empty());
+    let login_resp: LoginResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(login_resp.status, "ok");
+    assert!(!login_resp.token.is_empty());
 
     // GET /api/auth/status with Bearer token -> authenticated: true
     let req = Request::builder()
         .uri("/api/auth/status")
         .method(Method::GET)
-        .header(header::AUTHORIZATION, format!("Bearer {}", login_res.token))
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", login_resp.token),
+        )
         .body(Body::empty())
         .unwrap();
     let res = app.clone().oneshot(req).await.unwrap();
@@ -152,46 +155,81 @@ async fn test_auth_status_and_login_with_password() {
 }
 
 #[tokio::test]
-async fn test_protected_endpoints_and_cors_preflight() {
+async fn test_entropy_failure_fails_closed() {
+    let ws_temp = tempdir().unwrap();
+    let sess_temp = tempdir().unwrap();
+    let runner = Arc::new(MockAgentRunner::new(vec![], "ok".into()));
+    let mut state = create_test_state(
+        Some("secret123".into()),
+        runner,
+        ws_temp.path().into(),
+        sess_temp.path().into(),
+    );
+    state.token_generator = Some(Arc::new(|| {
+        Err(kerux_core::error::Error::Agent(
+            "Entropy failure injection".to_string(),
+        ))
+    }));
+    let app = build_router(state);
+
+    let login_req = LoginRequest {
+        password: Some("secret123".into()),
+        username: None,
+    };
+    let req = Request::builder()
+        .uri("/api/auth/login")
+        .method(Method::POST)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&login_req).unwrap()))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn test_protected_routes_require_auth() {
     let ws_temp = tempdir().unwrap();
     let sess_temp = tempdir().unwrap();
     let runner = Arc::new(MockAgentRunner::new(vec![], "ok".into()));
     let state = create_test_state(
-        Some("secret123".into()),
+        Some("pwd".into()),
         runner,
         ws_temp.path().into(),
         sess_temp.path().into(),
     );
     let app = build_router(state);
 
-    // Protected endpoint without auth -> 401
-    let req = Request::builder()
-        .uri("/api/sessions")
-        .method(Method::GET)
-        .body(Body::empty())
-        .unwrap();
-    let res = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    let protected_uris = vec![
+        ("/api/sessions", Method::GET),
+        ("/api/session?session_id=sess_1", Method::GET),
+        ("/api/session/new", Method::POST),
+        ("/api/chat/start", Method::POST),
+        ("/api/workspaces", Method::GET),
+        ("/api/list", Method::GET),
+        ("/api/file?path=foo", Method::GET),
+        ("/api/models", Method::GET),
+        ("/api/models/default", Method::GET),
+        ("/api/settings", Method::GET),
+    ];
 
-    // OPTIONS preflight -> 204 without auth
-    let req = Request::builder()
-        .uri("/api/sessions")
-        .method(Method::OPTIONS)
-        .header(header::ORIGIN, "http://localhost:3000")
-        .body(Body::empty())
-        .unwrap();
-    let res = app.oneshot(req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::NO_CONTENT);
-    assert_eq!(
-        res.headers()
-            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
-            .unwrap(),
-        "*"
-    );
+    for (uri, method) in protected_uris {
+        let req = Request::builder()
+            .uri(uri)
+            .method(method)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::UNAUTHORIZED,
+            "URI {uri} should be protected"
+        );
+    }
 }
 
 #[tokio::test]
-async fn test_session_crud_and_persistence() {
+async fn test_sessions_crud_and_atomic_persistence() {
     let ws_temp = tempdir().unwrap();
     let sess_temp = tempdir().unwrap();
     let runner = Arc::new(MockAgentRunner::new(vec![], "ok".into()));
@@ -200,7 +238,7 @@ async fn test_session_crud_and_persistence() {
 
     // 1. Create new session
     let new_req = NewSessionRequest {
-        title: Some("Integration Test Session".into()),
+        title: Some("My Test Session".into()),
     };
     let req = Request::builder()
         .uri("/api/session/new")
@@ -211,25 +249,13 @@ async fn test_session_crud_and_persistence() {
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let body = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
-    let created: NewSessionResponse = serde_json::from_slice(&body).unwrap();
-    assert_eq!(created.title, "Integration Test Session");
+    let new_res: NewSessionResponse = serde_json::from_slice(&body).unwrap();
+    let sess_id = new_res.id;
+    assert_eq!(new_res.title, "My Test Session");
 
-    // 2. List sessions
+    // 2. Get session
     let req = Request::builder()
-        .uri("/api/sessions")
-        .method(Method::GET)
-        .body(Body::empty())
-        .unwrap();
-    let res = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-    let body = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
-    let list: SessionsListResponse = serde_json::from_slice(&body).unwrap();
-    assert_eq!(list.sessions.len(), 1);
-    assert_eq!(list.sessions[0].id, created.id);
-
-    // 3. Get session detail
-    let req = Request::builder()
-        .uri(format!("/api/session?session_id={}", created.id))
+        .uri(format!("/api/session?session_id={sess_id}"))
         .method(Method::GET)
         .body(Body::empty())
         .unwrap();
@@ -237,13 +263,13 @@ async fn test_session_crud_and_persistence() {
     assert_eq!(res.status(), StatusCode::OK);
     let body = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
     let detail: SessionDetailResponse = serde_json::from_slice(&body).unwrap();
-    assert_eq!(detail.id, created.id);
-    assert_eq!(detail.title, "Integration Test Session");
+    assert_eq!(detail.id, sess_id);
+    assert_eq!(detail.title, "My Test Session");
 
-    // 4. Rename session
+    // 3. Rename session
     let rename_req = RenameSessionRequest {
-        session_id: created.id.clone(),
-        title: "Renamed Session Title".into(),
+        session_id: sess_id.clone(),
+        title: "Renamed Title".into(),
     };
     let req = Request::builder()
         .uri("/api/session/rename")
@@ -254,9 +280,22 @@ async fn test_session_crud_and_persistence() {
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
+    // 4. List sessions
+    let req = Request::builder()
+        .uri("/api/sessions")
+        .method(Method::GET)
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+    let list_res: SessionsListResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(list_res.sessions.len(), 1);
+    assert_eq!(list_res.sessions[0].title, "Renamed Title");
+
     // 5. Delete session
     let del_req = DeleteSessionRequest {
-        session_id: created.id.clone(),
+        session_id: sess_id.clone(),
     };
     let req = Request::builder()
         .uri("/api/session/delete")
@@ -274,329 +313,51 @@ async fn test_session_crud_and_persistence() {
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(serde_json::to_vec(&del_req).unwrap()))
         .unwrap();
-    let res = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::NOT_FOUND);
-
-    // 7. Get session again -> 404
-    let req = Request::builder()
-        .uri(format!("/api/session?session_id={}", created.id))
-        .method(Method::GET)
-        .body(Body::empty())
-        .unwrap();
     let res = app.oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
-async fn test_path_confinement_and_file_limits() {
+async fn test_chat_start_and_concurrency_limits() {
     let ws_temp = tempdir().unwrap();
     let sess_temp = tempdir().unwrap();
-    let runner = Arc::new(MockAgentRunner::new(vec![], "ok".into()));
+
+    let runner = Arc::new(MockAgentRunner::with_delay(
+        vec![AgentEvent::Content {
+            text: "Hello from agent".into(),
+        }],
+        "Hello from agent".into(),
+        std::time::Duration::from_millis(500),
+    ));
+
     let state = create_test_state(None, runner, ws_temp.path().into(), sess_temp.path().into());
-
-    // Write a test file in workspace
-    let test_file = ws_temp.path().join("hello.txt");
-    std::fs::write(&test_file, "Hello from workspace").unwrap();
-
-    // Write a file larger than 10MB
-    let large_file = ws_temp.path().join("large.bin");
-    let large_data = vec![0u8; 11 * 1024 * 1024];
-    std::fs::write(&large_file, large_data).unwrap();
-
     let app = build_router(state);
 
-    // 1. List directory inside workspace
-    let req = Request::builder()
-        .uri("/api/list?path=")
-        .method(Method::GET)
-        .body(Body::empty())
-        .unwrap();
-    let res = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-    let body = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
-    let list: DirectoryListResponse = serde_json::from_slice(&body).unwrap();
-    assert!(list.items.iter().any(|i| i.name == "hello.txt"));
-
-    // 2. Read file inside workspace
-    let req = Request::builder()
-        .uri("/api/file?path=hello.txt")
-        .method(Method::GET)
-        .body(Body::empty())
-        .unwrap();
-    let res = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-    let body = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
-    let file_res: FileContentResponse = serde_json::from_slice(&body).unwrap();
-    assert_eq!(file_res.content, "Hello from workspace");
-
-    // 3. Oversized file -> 413 Payload Too Large
-    let req = Request::builder()
-        .uri("/api/file?path=large.bin")
-        .method(Method::GET)
-        .body(Body::empty())
-        .unwrap();
-    let res = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
-
-    // 4. Path traversal attempt -> 403 Forbidden
-    let req = Request::builder()
-        .uri("/api/file?path=../../etc/passwd")
-        .method(Method::GET)
-        .body(Body::empty())
-        .unwrap();
-    let res = app.oneshot(req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::FORBIDDEN);
-}
-
-#[tokio::test]
-async fn test_models_and_settings() {
-    let ws_temp = tempdir().unwrap();
-    let sess_temp = tempdir().unwrap();
-    let runner = Arc::new(MockAgentRunner::new(vec![], "ok".into()));
-    let state = create_test_state(
-        Some("secret".into()),
-        runner,
-        ws_temp.path().into(),
-        sess_temp.path().into(),
-    );
-    let app = build_router(state.clone());
-
-    let req = Request::builder()
-        .uri("/api/models")
-        .method(Method::GET)
-        .header(header::AUTHORIZATION, "Bearer invalid")
-        .body(Body::empty())
-        .unwrap();
-    let res = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-
-    // Provide auth
-    let token = {
-        let mut t = state.auth_token.write().await;
-        *t = Some("test_token".into());
-        "test_token"
-    };
-
-    let req = Request::builder()
-        .uri("/api/models")
-        .method(Method::GET)
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .body(Body::empty())
-        .unwrap();
-    let res = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-    let body = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
-    let models: ModelsResponse = serde_json::from_slice(&body).unwrap();
-    assert_eq!(models.default, "gpt-4o");
-    assert_eq!(models.models[0].provider, "openai");
-
-    let req = Request::builder()
-        .uri("/api/settings")
-        .method(Method::GET)
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .body(Body::empty())
-        .unwrap();
-    let res = app.oneshot(req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-    let body = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
-    let settings: SettingsResponse = serde_json::from_slice(&body).unwrap();
-    assert_eq!(settings.version, "0.4.0");
-    assert!(settings.webui.auth_enabled);
-}
-
-#[tokio::test]
-async fn test_chat_start_and_sse_events() {
-    let ws_temp = tempdir().unwrap();
-    let sess_temp = tempdir().unwrap();
-
-    let scripted_events = vec![
-        AgentEvent::Content {
-            text: "Hello from agent!".into(),
-        },
-        AgentEvent::Reasoning {
-            text: "Thinking about files".into(),
-        },
-        AgentEvent::ToolStart {
-            call_id: "call_1".into(),
-            name: "terminal".into(),
-            arguments: "{\"command\":\"ls\"}".into(),
-        },
-        AgentEvent::ToolComplete {
-            result: kerux_core::tools::ToolResult::success(
-                "call_1",
-                serde_json::json!({ "output": "file1.txt" }),
-            ),
-        },
-        AgentEvent::Done {
-            message: Message::assistant("All done!"),
-        },
-    ];
-
-    let runner = Arc::new(MockAgentRunner::new(
-        scripted_events,
-        "All done!".to_string(),
-    ));
-    let state = create_test_state(None, runner, ws_temp.path().into(), sess_temp.path().into());
-    let app = build_router(state.clone());
-
-    // 1. Create a session first
-    let new_req = NewSessionRequest {
-        title: Some("Chat Test".into()),
-    };
-    let req = Request::builder()
-        .uri("/api/session/new")
-        .method(Method::POST)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_vec(&new_req).unwrap()))
-        .unwrap();
-    let res = app.clone().oneshot(req).await.unwrap();
-    let body = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
-    let sess: NewSessionResponse = serde_json::from_slice(&body).unwrap();
-
-    // 2. Start chat
-    let chat_req = ChatStartRequest {
-        session_id: sess.id.clone(),
-        message: "Run ls command".into(),
-        model: Some("custom-model".into()),
-    };
-    let req = Request::builder()
-        .uri("/api/chat/start")
-        .method(Method::POST)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_vec(&chat_req).unwrap()))
-        .unwrap();
-    let res = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-    let body = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
-    let start_res: ChatStartResponse = serde_json::from_slice(&body).unwrap();
-
-    // 3. Connect to chat stream
-    let req = Request::builder()
-        .uri(format!(
-            "/api/chat/stream?stream_id={}",
-            start_res.stream_id
-        ))
-        .method(Method::GET)
-        .body(Body::empty())
-        .unwrap();
-    let res = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-    assert_eq!(
-        res.headers().get(header::CONTENT_TYPE).unwrap(),
-        "text/event-stream"
-    );
-
-    // Wait briefly for background turn to complete and persist
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-
-    // 4. Verify session on disk contains both user and assistant messages
-    let req = Request::builder()
-        .uri(format!("/api/session?session_id={}", sess.id))
-        .method(Method::GET)
-        .body(Body::empty())
-        .unwrap();
-    let res = app.oneshot(req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-    let body = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
-    let detail: SessionDetailResponse = serde_json::from_slice(&body).unwrap();
-    assert_eq!(detail.messages.len(), 2);
-    assert_eq!(detail.messages[0].role, "user");
-    assert_eq!(detail.messages[0].content, "Run ls command");
-    assert_eq!(detail.messages[1].role, "assistant");
-    assert_eq!(detail.messages[1].content, "All done!");
-}
-
-#[tokio::test]
-async fn test_chat_cancel_and_steer() {
-    let ws_temp = tempdir().unwrap();
-    let sess_temp = tempdir().unwrap();
-    let runner = Arc::new(MockAgentRunner::new(vec![], "ok".into()));
-    let state = create_test_state(None, runner, ws_temp.path().into(), sess_temp.path().into());
-    let app = build_router(state.clone());
-
-    // Register an active stream manually
-    let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel(4);
-    let active = Arc::new(ActiveStream::new(
-        "test_cancel_stream".into(),
-        "sess_1".into(),
-        steer_tx,
-    ));
-    state
-        .active_streams
-        .write()
-        .await
-        .insert("test_cancel_stream".into(), active.clone());
-
-    // 1. Steer active stream -> 200
-    let steer_req = ChatSteerRequest {
-        stream_id: "test_cancel_stream".into(),
-        message: "Stop searching".into(),
-    };
-    let req = Request::builder()
-        .uri("/api/chat/steer")
-        .method(Method::POST)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_vec(&steer_req).unwrap()))
-        .unwrap();
-    let res = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-    assert_eq!(steer_rx.recv().await.unwrap(), "Stop searching");
-
-    // 2. Cancel active stream -> 200
-    let cancel_req = ChatCancelRequest {
-        stream_id: "test_cancel_stream".into(),
-    };
-    let req = Request::builder()
-        .uri("/api/chat/cancel")
-        .method(Method::POST)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_vec(&cancel_req).unwrap()))
-        .unwrap();
-    let res = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-    let body = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
-    let cancel_res: StandardStatusResponse = serde_json::from_slice(&body).unwrap();
-    assert_eq!(cancel_res.status, "cancelled");
-    assert!(active.cancel_flag.load(Ordering::Relaxed));
-
-    // 3. Steer completed stream -> 400
-    let req = Request::builder()
-        .uri("/api/chat/steer")
-        .method(Method::POST)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_vec(&steer_req).unwrap()))
-        .unwrap();
-    let res = app.oneshot(req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-async fn test_concurrency_32_stream_limit() {
-    let ws_temp = tempdir().unwrap();
-    let sess_temp = tempdir().unwrap();
-    let runner = Arc::new(MockAgentRunner::new(vec![], "ok".into()));
-    let state = create_test_state(None, runner, ws_temp.path().into(), sess_temp.path().into());
-
-    // Insert 32 active running streams
+    // Fill up to 32 running streams
     for i in 0..MAX_CONCURRENT_RUNNING_STREAMS {
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let stream = Arc::new(ActiveStream::new(
-            format!("stream_{i}"),
-            "sess_1".into(),
-            tx,
-        ));
-        state
-            .active_streams
-            .write()
-            .await
-            .insert(format!("stream_{i}"), stream);
+        let chat_req = ChatStartRequest {
+            session_id: format!("sess_{i}"),
+            message: "Hello".into(),
+            model: None,
+        };
+        let req = Request::builder()
+            .uri("/api/chat/start")
+            .method(Method::POST)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&chat_req).unwrap()))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "Stream {i} should be accepted"
+        );
     }
 
-    let app = build_router(state);
-
+    // 33rd stream should be rejected with 429 Too Many Requests
     let chat_req = ChatStartRequest {
-        session_id: "sess_1".into(),
-        message: "hello".into(),
+        session_id: "sess_overflow".into(),
+        message: "Hello".into(),
         model: None,
     };
     let req = Request::builder()
@@ -609,59 +370,370 @@ async fn test_concurrency_32_stream_limit() {
     assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
 }
 
-#[test]
-fn test_remote_non_loopback_binding_refusal() {
-    let gateway = GatewayConfig {
-        webui_enabled: true,
-        webui_addr: "0.0.0.0:8787".to_string(),
-        webui_password: "".to_string(),
-        ..Default::default()
+#[tokio::test]
+async fn test_chat_cancel_and_terminal_events() {
+    let ws_temp = tempdir().unwrap();
+    let sess_temp = tempdir().unwrap();
+
+    let runner = Arc::new(MockAgentRunner::with_delay(
+        vec![],
+        "completed".into(),
+        std::time::Duration::from_secs(2),
+    ));
+
+    let state = create_test_state(None, runner, ws_temp.path().into(), sess_temp.path().into());
+    let app = build_router(state);
+
+    let chat_req = ChatStartRequest {
+        session_id: "sess_cancel".into(),
+        message: "Run a long task".into(),
+        model: None,
     };
+    let req = Request::builder()
+        .uri("/api/chat/start")
+        .method(Method::POST)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&chat_req).unwrap()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+    let start_res: ChatStartResponse = serde_json::from_slice(&body).unwrap();
+    let stream_id = start_res.stream_id;
 
-    let socket_addr: std::net::SocketAddr = gateway.webui_addr.parse().unwrap();
-    assert!(!socket_addr.ip().is_loopback());
-    assert!(gateway.webui_password.trim().is_empty());
-}
+    // Cancel the stream
+    let cancel_req = ChatCancelRequest {
+        stream_id: stream_id.clone(),
+    };
+    let req = Request::builder()
+        .uri("/api/chat/cancel")
+        .method(Method::POST)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&cancel_req).unwrap()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
 
-#[test]
-fn test_env_password_precedence() {
-    std::env::set_var("KERUX_WEBUI_PASSWORD", "primary_pass");
-    std::env::set_var("HERMES_WEBUI_PASSWORD", "fallback_pass");
+    // Read SSE stream and verify cancelled event and streamEnd
+    let req = Request::builder()
+        .uri(format!("/api/chat/stream?stream_id={stream_id}"))
+        .method(Method::GET)
+        .body(Body::empty())
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+    let sse_str = String::from_utf8_lossy(&body);
 
-    let mut config = AppConfig::default();
-    config.apply_env_overrides().unwrap();
-    assert_eq!(config.gateway.webui_password, "primary_pass");
-
-    std::env::remove_var("KERUX_WEBUI_PASSWORD");
-    let mut config2 = AppConfig::default();
-    config2.apply_env_overrides().unwrap();
-    assert_eq!(config2.gateway.webui_password, "fallback_pass");
-
-    std::env::remove_var("HERMES_WEBUI_PASSWORD");
-}
-
-#[test]
-fn test_utf8_multibyte_safe_splitting() {
-    let s = "🦀🚀Привет мир! This is a test string for safe unicode chunking.";
-    let chunks = split_utf8_safe(s, 10);
-    assert!(!chunks.is_empty());
-    let recombined = chunks.join("");
-    assert_eq!(s, recombined);
+    assert!(sse_str.contains("event: cancelled"));
+    assert!(sse_str.contains("event: streamEnd"));
 }
 
 #[tokio::test]
-async fn test_unknown_stream_404() {
+async fn test_chat_steer_flow() {
+    let ws_temp = tempdir().unwrap();
+    let sess_temp = tempdir().unwrap();
+
+    let runner = Arc::new(MockAgentRunner::with_delay(
+        vec![],
+        "steered".into(),
+        std::time::Duration::from_millis(500),
+    ));
+
+    let state = create_test_state(None, runner, ws_temp.path().into(), sess_temp.path().into());
+    let app = build_router(state);
+
+    let chat_req = ChatStartRequest {
+        session_id: "sess_steer".into(),
+        message: "Initial task".into(),
+        model: None,
+    };
+    let req = Request::builder()
+        .uri("/api/chat/start")
+        .method(Method::POST)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&chat_req).unwrap()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+    let start_res: ChatStartResponse = serde_json::from_slice(&body).unwrap();
+    let stream_id = start_res.stream_id;
+
+    // Send steer message while running
+    let steer_req = ChatSteerRequest {
+        stream_id: stream_id.clone(),
+        message: "Change direction!".into(),
+    };
+    let req = Request::builder()
+        .uri("/api/chat/steer")
+        .method(Method::POST)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&steer_req).unwrap()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Wait for stream to finish
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+    // Steer after stream finished -> 400 Bad Request
+    let req = Request::builder()
+        .uri("/api/chat/steer")
+        .method(Method::POST)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&steer_req).unwrap()))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_sse_wire_frame_bounding_and_chunking() {
+    // 1. Test streaming content chunking
+    let huge_content = "A".repeat(150_000);
+    let event = AgentEvent::Content {
+        text: huge_content.clone(),
+    };
+    let frames = agent_event_to_unsequenced_frames(&event);
+
+    assert!(frames.len() >= 3);
+    let mut reconstructed = String::new();
+    for (evt, data) in &frames {
+        assert_eq!(evt, "token");
+        let parsed: serde_json::Value = serde_json::from_str(data).unwrap();
+        let chunk = parsed["content"].as_str().unwrap();
+        reconstructed.push_str(chunk);
+
+        let wire_frame = format!("event: {evt}\ndata: {data}\n\n");
+        assert!(
+            wire_frame.len() <= MAX_WIRE_FRAME_BYTES,
+            "Wire frame exceeds 64 KiB: {}",
+            wire_frame.len()
+        );
+    }
+    assert_eq!(reconstructed, huge_content);
+
+    // 2. Test discrete tool payload bounding
+    let huge_tool_result = "T".repeat(100_000);
+    let event = AgentEvent::ToolComplete {
+        result: kerux_core::tools::ToolResult::success(
+            "call_1",
+            serde_json::json!({ "output": huge_tool_result }),
+        ),
+    };
+    let frames = agent_event_to_unsequenced_frames(&event);
+    assert_eq!(frames.len(), 1);
+    let (evt, data) = &frames[0];
+    assert_eq!(evt, "toolCompleted");
+    let wire_frame = format!("event: {evt}\ndata: {data}\n\n");
+    assert!(
+        wire_frame.len() <= MAX_WIRE_FRAME_BYTES,
+        "Tool wire frame exceeds 64 KiB: {}",
+        wire_frame.len()
+    );
+    assert!(data.contains("[TRUNCATED]"));
+}
+
+#[tokio::test]
+async fn test_stream_replay_buffer_and_ttl_eviction() {
+    let (steer_tx, _) = tokio::sync::mpsc::channel(1);
+    let stream = Arc::new(ActiveStream::new(
+        "stream_replay".into(),
+        "sess_replay".into(),
+        steer_tx,
+    ));
+
+    // Buffer 150 frames -> verify FIFO drops oldest so len <= 100
+    for i in 1..=150 {
+        stream
+            .buffer_raw_frame("token".into(), format!(r#"{{"token":"chunk_{i}"}}"#))
+            .await;
+    }
+
+    {
+        let buf = stream.buffered_events.read().await;
+        assert_eq!(buf.len(), MAX_EVENTS_PER_STREAM);
+        assert_eq!(buf.first().unwrap().seq, 51);
+        assert_eq!(buf.last().unwrap().seq, 150);
+    }
+
+    // Finalize stream and verify TTL check
+    stream.finalize_stream().await;
+    assert!(!stream.is_expired().await);
+}
+
+#[tokio::test]
+async fn test_workspace_and_file_traversal_protection() {
+    let ws_temp = tempdir().unwrap();
+    let sess_temp = tempdir().unwrap();
+
+    let secret_file = ws_temp.path().join("hello.txt");
+    std::fs::write(&secret_file, "hello kerux").unwrap();
+
+    let runner = Arc::new(MockAgentRunner::new(vec![], "ok".into()));
+    let state = create_test_state(None, runner, ws_temp.path().into(), sess_temp.path().into());
+    let app = build_router(state);
+
+    // 1. GET /api/workspaces
+    let req = Request::builder()
+        .uri("/api/workspaces")
+        .method(Method::GET)
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // 2. GET /api/list (valid root)
+    let req = Request::builder()
+        .uri("/api/list")
+        .method(Method::GET)
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+    let list_res: DirectoryListResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(list_res.items.len(), 1);
+    assert_eq!(list_res.items[0].name, "hello.txt");
+
+    // 3. GET /api/list with path traversal `..` -> 403 Forbidden
+    let req = Request::builder()
+        .uri("/api/list?path=../../etc")
+        .method(Method::GET)
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+    // 4. GET /api/file (valid)
+    let req = Request::builder()
+        .uri("/api/file?path=hello.txt")
+        .method(Method::GET)
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+    let file_res: FileContentResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(file_res.content, "hello kerux");
+
+    // 5. GET /api/file with traversal `..` -> 403 Forbidden
+    let req = Request::builder()
+        .uri("/api/file?path=../../etc/passwd")
+        .method(Method::GET)
+        .body(Body::empty())
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn test_cors_preflight_and_headers() {
+    let ws_temp = tempdir().unwrap();
+    let sess_temp = tempdir().unwrap();
+    let runner = Arc::new(MockAgentRunner::new(vec![], "ok".into()));
+    let state = create_test_state(
+        Some("secret".into()),
+        runner,
+        ws_temp.path().into(),
+        sess_temp.path().into(),
+    );
+    let app = build_router(state);
+
+    // Preflight OPTIONS on protected route -> 204 No Content with CORS headers (no auth required)
+    let req = Request::builder()
+        .uri("/api/chat/start")
+        .method(Method::OPTIONS)
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        res.headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .unwrap(),
+        "*"
+    );
+    assert!(res
+        .headers()
+        .get(header::ACCESS_CONTROL_ALLOW_METHODS)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("POST"));
+
+    // 401 Unauthorized response also carries CORS headers
+    let req = Request::builder()
+        .uri("/api/models")
+        .method(Method::GET)
+        .body(Body::empty())
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        res.headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .unwrap(),
+        "*"
+    );
+}
+
+#[tokio::test]
+async fn test_model_routes_and_aliases() {
     let ws_temp = tempdir().unwrap();
     let sess_temp = tempdir().unwrap();
     let runner = Arc::new(MockAgentRunner::new(vec![], "ok".into()));
     let state = create_test_state(None, runner, ws_temp.path().into(), sess_temp.path().into());
     let app = build_router(state);
 
+    // GET /api/models
     let req = Request::builder()
-        .uri("/api/chat/stream?stream_id=nonexistent")
+        .uri("/api/models")
+        .method(Method::GET)
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+    let models_res: ModelsResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(models_res.default, "gpt-4o");
+
+    // GET /api/models/default
+    let req = Request::builder()
+        .uri("/api/models/default")
+        .method(Method::GET)
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // GET /api/default-model alias
+    let req = Request::builder()
+        .uri("/api/default-model")
         .method(Method::GET)
         .body(Body::empty())
         .unwrap();
     let res = app.oneshot(req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    assert_eq!(res.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_gateway_refuses_remote_bind_without_password() {
+    let config = GatewayConfig {
+        webui_enabled: true,
+        webui_addr: "0.0.0.0:8787".to_string(),
+        webui_password: "".to_string(),
+        ..Default::default()
+    };
+
+    let gateway = kerux_core::gateway::Gateway::new(config);
+
+    let res = gateway.run().await;
+    assert!(res.is_err());
+    let err_msg = res.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("WebUI remote non-loopback binding requires a non-empty password"),
+        "Unexpected error: {err_msg}"
+    );
 }

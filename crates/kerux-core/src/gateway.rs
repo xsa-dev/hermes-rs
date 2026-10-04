@@ -696,7 +696,7 @@ impl Gateway {
             ));
         }
 
-        if self.config.webui_enabled {
+        let webui_listener = if self.config.webui_enabled {
             let addr_str = &self.config.webui_addr;
             let socket_addr: std::net::SocketAddr = addr_str.parse().map_err(|e| {
                 crate::error::Error::Config(format!("Invalid webui_addr '{addr_str}': {e}"))
@@ -706,17 +706,17 @@ impl Gateway {
                     "WebUI remote non-loopback binding requires a non-empty password".to_string(),
                 ));
             }
-            let webui_state = crate::webui::WebUiState::new(
-                Arc::new(tokio::sync::RwLock::new(runtime_config())),
-                self.config.webui_password.clone(),
-                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-            );
-            tokio::spawn(async move {
-                if let Err(e) = crate::webui::serve_webui(webui_state, socket_addr).await {
-                    error!("WebUI server error: {e}");
-                }
-            });
-        }
+            let listener = tokio::net::TcpListener::bind(socket_addr)
+                .await
+                .map_err(|e| {
+                    crate::error::Error::Agent(format!(
+                        "Failed to bind WebUI listener at {socket_addr}: {e}"
+                    ))
+                })?;
+            Some((listener, socket_addr))
+        } else {
+            None
+        };
 
         let webhook_listener = if self.config.webhooks_enabled {
             let address = self.config.webhooks_addr.as_deref().ok_or_else(|| {
@@ -750,6 +750,28 @@ impl Gateway {
         // slowest adapter starve the rest. Each task owns its own loop and
         // dispatches into the shared gateway.
         let mut handles = Vec::new();
+
+        if let Some((listener, address)) = webui_listener {
+            let webui_state = crate::webui::WebUiState::new(
+                Arc::new(tokio::sync::RwLock::new(runtime_config())),
+                self.config.webui_password.clone(),
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            );
+            let running = self.running.clone();
+            handles.push(tokio::spawn(async move {
+                info!(%address, "WebUI server listening at http://{address}");
+                let shutdown = async move {
+                    while *running.read().await {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                };
+                if let Err(e) =
+                    crate::webui::serve_webui_listener(listener, webui_state, shutdown).await
+                {
+                    error!("WebUI server stopped with error: {e}");
+                }
+            }));
+        }
 
         if let Some(listener) = webhook_listener {
             let address = listener.local_addr().map_err(|error| {

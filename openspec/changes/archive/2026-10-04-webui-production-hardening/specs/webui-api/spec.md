@@ -1,8 +1,22 @@
-# webui-api Specification
+# webui-api Specification Deltas
 
-## Purpose
-TBD - created by archiving change webui-api-compat. Update Purpose after archive.
-## Requirements
+## ADDED Requirements
+
+### Requirement: Gateway WebUI Service Lifecycle
+When `webui_enabled` is true in Gateway configuration, `Gateway::run()` MUST synchronously bind a `tokio::net::TcpListener` before reporting readiness, pass the pre-bound listener to the WebUI server task, add the running WebUI server task to the gateway task handles, propagate runtime serve errors upon task exit, and gracefully terminate the listener when a shutdown signal is received.
+
+#### Scenario: WebUI-only gateway stays running until shutdown signal
+- **Given** Gateway configuration with `webui_enabled = true` and no messaging adapters or webhooks
+- **When** `Gateway::run()` is invoked
+- **Then** the WebUI server starts listening, `run()` remains running indefinitely, and exits cleanly upon receiving shutdown signal
+
+#### Scenario: Synchronous failure propagation on bind error
+- **Given** Gateway configuration with `webui_enabled = true` and an invalid or already-bound address
+- **When** `Gateway::run()` is invoked
+- **Then** `Gateway::run()` returns an error immediately without hanging or silently ignoring the failure
+
+## MODIFIED Requirements
+
 ### Requirement: Health and Authentication Probing
 The server MUST provide `/health` and `/api/auth/status` endpoints to allow clients to verify server connectivity and authentication state. Token generation MUST be cryptographically secure and fail-closed. When password protection is enabled in configuration (`webui_password` is non-empty), unauthorized requests to all protected endpoints (`/api/sessions`, `/api/session`, `/api/session/*`, `/api/chat/*`, `/api/workspaces`, `/api/list`, `/api/file`, `/api/models`, `/api/models/default`, `/api/default-model`, `/api/settings`) MUST return HTTP 401 Unauthorized (`{"error": "Unauthorized"}`) until authenticated via `/api/auth/login`. CORS middleware MUST apply standard CORS headers (`Access-Control-Allow-Origin: *`, `Access-Control-Allow-Methods: GET, POST, OPTIONS`, `Access-Control-Allow-Headers: Authorization, Content-Type, hermes-auth`, and `Access-Control-Max-Age: 86400`) across all responses (200, 204, 401, 403, 404, 413, 429, 500). Same-origin browser sessions MAY use the `hermes_auth` cookie, while cross-origin API clients use Bearer authentication.
 
@@ -50,39 +64,6 @@ The server MUST provide `/health` and `/api/auth/status` endpoints to allow clie
 - **Given** the Kerux WebUI server is running with password protection and OS entropy generation fails
 - **When** a client attempts `POST /api/auth/login`
 - **Then** the server responds with HTTP 500 Internal Server Error, does not issue an auth token, and sets no authentication cookie
-
-### Requirement: Session Management Endpoints
-The server MUST provide endpoints to list, retrieve, create, rename, and delete conversation sessions stored as JSON files under `{session_dir}/{session_id}.json`. Session IDs MUST be validated to match `^[a-zA-Z0-9_-]{1,64}$`. Mutations to a session MUST be serialized with a per-session mutex.
-
-#### Scenario: Listing sessions
-- **Given** session files exist in the sessions directory
-- **When** an authenticated client sends a `GET /api/sessions` request
-- **Then** the server responds with HTTP 200 OK and body `{"sessions": [{"id": "sess-1", "title": "Session 1", "created_at": 1720000000, "updated_at": 1720000100, "message_count": 4}]}`
-
-#### Scenario: Fetching single session history
-- **Given** a session with ID `sess-123` exists
-- **When** an authenticated client sends a `GET /api/session?session_id=sess-123` request
-- **Then** the server responds with HTTP 200 OK and body `{"id": "sess-123", "title": "My Session", "created_at": 1720000000, "updated_at": 1720000100, "messages": [{"role": "user", "content": "hello", "timestamp": 1720000050}]}`
-
-#### Scenario: Fetching nonexistent session returns 404
-- **Given** no session exists with ID `sess-none`
-- **When** an authenticated client sends a `GET /api/session?session_id=sess-none` request
-- **Then** the server responds with HTTP 404 Not Found and body `{"error": "Session not found"}`
-
-#### Scenario: Creating a new session
-- **Given** the server is running
-- **When** an authenticated client sends a `POST /api/session/new` request with `{"title": "My New Session"}`
-- **Then** the server creates a new session file and responds with HTTP 200 OK with `{"id": "<session_id>", "title": "My New Session"}`
-
-#### Scenario: Renaming an existing session
-- **Given** a session with ID `sess-123` exists
-- **When** an authenticated client sends a `POST /api/session/rename` request with `{"session_id": "sess-123", "title": "Renamed Title"}`
-- **Then** the server updates the title on disk and responds with HTTP 200 OK with `{"status": "ok"}`
-
-#### Scenario: Deleting an existing session
-- **Given** a session with ID `sess-123` exists
-- **When** an authenticated client sends a `POST /api/session/delete` request with `{"session_id": "sess-123"}`
-- **Then** the server removes the session file from disk and responds with HTTP 200 OK with `{"status": "ok"}`
 
 ### Requirement: Chat Start and SSE Stream Protocol
 The server MUST accept chat turn initiation via `POST /api/chat/start` and stream real-time events via Server-Sent Events on `GET /api/chat/stream?stream_id=...` using standard SSE syntax (`event: <name>\n` and `data: <json>\n\n` framing). Every emitted SSE wire frame across all 11 event variants MUST be dynamically measured and strictly <= 64 KiB (65,536 bytes). The server MUST enforce a concurrency ceiling of 32 running streams, safely chunk oversized payload text across streaming events (`token`, `reasoning`), truncate oversized tool payload strings (> 60,000 bytes) with a notice to keep atomic frames <= 64 KiB, serialize session message writes (saving user message at turn start and assistant message at turn completion), and automatically evict completed streams that have finished over 5 minutes ago via a background stream GC task owned by the WebUI server and on request paths. All stream completions (normal, error, cancellation, panic) MUST transition through an atomic state machine (`0: Active`, `1: Completed`, `2: Cancelled`, `3: Errored`, `4: PanicCaught`) using atomic CAS linearization (`0 -> target`), emitting exactly one terminal `streamEnd` frame.
@@ -148,24 +129,6 @@ The server MUST accept chat turn initiation via `POST /api/chat/start` and strea
 - **When** the event converter processes the payload
 - **Then** the payload text is safely bounded with a truncation notice so the emitted JSON wire frame is strictly <= 64 KiB
 
-### Requirement: Stream Cancellation and Steering
-The server MUST allow clients to cancel an in-flight stream or steer the running agent.
-
-#### Scenario: Cancelling active chat stream
-- **Given** a running agent stream `stream-abc`
-- **When** an authenticated client sends a `POST /api/chat/cancel` request with `{"stream_id": "stream-abc"}`
-- **Then** the server signals cooperative cancellation to the agent, emits `event: cancelled`, emits `event: streamEnd`, releases the running stream slot, and returns HTTP 200 OK with `{"status": "cancelled"}`
-
-#### Scenario: Steering active chat stream
-- **Given** a running agent stream `stream-abc` with an active `steer_tx` channel
-- **When** an authenticated client sends a `POST /api/chat/steer` request with `{"stream_id": "stream-abc", "message": "Please stop searching and answer now"}`
-- **Then** the server delivers the steering message to the active agent execution channel and returns HTTP 200 OK with `{"status": "ok"}`
-
-#### Scenario: Steering an inactive stream returns Bad Request
-- **Given** a stream `stream-completed` that is not currently running
-- **When** an authenticated client sends a `POST /api/chat/steer` request with `{"stream_id": "stream-completed", "message": "hi"}`
-- **Then** the server responds with HTTP 400 Bad Request and body `{"error": "Stream is not active"}`
-
 ### Requirement: Workspace and Model Introspection
 The server MUST provide endpoints for workspace browsing, file inspection, and model inspection, supporting both `/api/models/default` and `/api/default-model`, with strict path canonicalization and symlink escape rejection. All filesystem operations MUST be non-blocking.
 
@@ -211,17 +174,3 @@ The server MUST provide endpoints for workspace browsing, file inspection, and m
 - **Given** configured model `gpt-4o`
 - **When** an authenticated client sends `GET /api/models/default` or `GET /api/default-model`
 - **Then** the server responds with HTTP 200 OK and body `{"model": "gpt-4o"}`
-
-### Requirement: Gateway WebUI Service Lifecycle
-When `webui_enabled` is true in Gateway configuration, `Gateway::run()` MUST synchronously bind a `tokio::net::TcpListener` before reporting readiness, pass the pre-bound listener to the WebUI server task, add the running WebUI server task to the gateway task handles, propagate runtime serve errors upon task exit, and gracefully terminate the listener when a shutdown signal is received.
-
-#### Scenario: WebUI-only gateway stays running until shutdown signal
-- **Given** Gateway configuration with `webui_enabled = true` and no messaging adapters or webhooks
-- **When** `Gateway::run()` is invoked
-- **Then** the WebUI server starts listening, `run()` remains running indefinitely, and exits cleanly upon receiving shutdown signal
-
-#### Scenario: Synchronous failure propagation on bind error
-- **Given** Gateway configuration with `webui_enabled = true` and an invalid or already-bound address
-- **When** `Gateway::run()` is invoked
-- **Then** `Gateway::run()` returns an error immediately without hanging or silently ignoring the failure
-
