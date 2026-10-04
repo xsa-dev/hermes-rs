@@ -89,6 +89,7 @@ pub mod tools;
 pub mod trajectory;
 pub mod validation;
 pub mod validators;
+pub mod webui;
 
 pub use agent::{AgentConfig, AgentEvent, AgentTelemetry, KeruxAgent};
 pub use auth::{
