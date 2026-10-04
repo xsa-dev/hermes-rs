@@ -39,6 +39,8 @@
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 
+#![allow(clippy::double_must_use)]
+
 use std::sync::{Mutex, MutexGuard};
 
 /// Locks a synchronous mutex and recovers its guarded data after poisoning.
